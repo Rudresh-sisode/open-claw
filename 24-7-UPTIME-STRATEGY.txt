@@ -1,0 +1,446 @@
+================================================================================
+   HOW TO KEEP OPENCLAW RUNNING 24/7 ON VERCEL SANDBOX
+   (Even with 30-min to 5-hour timeout limits)
+================================================================================
+
+
+================================================================================
+STRATEGY 1: AUTO-EXTEND TIMEOUT (Primary Method - Recommended)
+================================================================================
+
+The Problem:
+------------
+Sandbox has max timeout → Will auto-shutdown → OpenClaw stops
+
+The Solution:
+------------
+Vercel Cron Job automatically extends timeout BEFORE it expires
+
+
+TIMELINE VIEW:
+--------------
+
+Hour 0                Hour 4                Hour 8               Hour 12
+  |                     |                     |                     |
+  |   Sandbox Active    |   Sandbox Active    |   Sandbox Active    |
+  |   (4:59 remaining)  |   (4:59 remaining)  |   (4:59 remaining)  |
+  |                     |                     |                     |
+  v                     v                     v                     v
+[Create]              [Extend]              [Extend]              [Extend]
+Sandbox               Timeout               Timeout               Timeout
+Timeout: 5h           +5h more              +5h more              +5h more
+  |                     |                     |                     |
+  |                     |                     |                     |
+  +-------------------->|-------------------->|-------------------->|
+      Still running         Still running         Still running
+      
+Result: INFINITE UPTIME (as long as cron job keeps running)
+
+
+DETAILED FLOW:
+--------------
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                    YOUR VERCEL APPLICATION                          │
+└─────────────────────────────────────────────────────────────────────┘
+                                 │
+                                 │
+                    ┌────────────▼────────────┐
+                    │   VERCEL CRON JOB       │
+                    │   (Runs every 4 hours)  │
+                    │                         │
+                    │  /api/cron/extend       │
+                    └────────────┬────────────┘
+                                 │
+                                 │ Every 4 hours
+                                 │
+                    ┌────────────▼─────────────────────────────────┐
+                    │  EXTENSION LOGIC                             │
+                    │                                              │
+                    │  1. Find all active sandboxes               │
+                    │  2. Check expiration time                   │
+                    │  3. If expiring < 1 hour:                   │
+                    │     → Call Vercel API: extendTimeout()      │
+                    │     → Add 5 more hours                      │
+                    │  4. Update database with new expiry time    │
+                    └──────────────────────────────────────────────┘
+                                 │
+                                 │
+                    ┌────────────▼────────────┐
+                    │   USER'S SANDBOX        │
+                    │   ┌──────────────────┐  │
+                    │   │   OpenClaw       │  │
+                    │   │   Running 24/7   │  │
+                    │   └──────────────────┘  │
+                    └─────────────────────────┘
+
+
+CODE EXAMPLE:
+-------------
+
+// Cron job runs every 4 hours
+exports async function extendAllSandboxes() {
+  
+  // Get all active sandboxes
+  sandboxes = database.getActive()
+  
+  for (sandbox in sandboxes) {
+    
+    // Check if expiring soon (within 1 hour)
+    if (sandbox.expiresAt < now + 1hour) {
+      
+      // Extend timeout by 5 hours
+      vercel.extendTimeout(sandbox.id, 5hours)
+      
+      // Update database
+      database.update(sandbox.id, expiresAt: now + 5hours)
+    }
+  }
+}
+
+
+PROS:
+✓ Seamless - User never notices
+✓ No downtime
+✓ No data loss
+✓ Cost-effective
+
+CONS:
+✗ Requires cron job monitoring
+✗ If cron fails, sandbox dies
+
+
+================================================================================
+STRATEGY 2: AUTO-RESTART FROM SNAPSHOT (Backup Method)
+================================================================================
+
+The Problem:
+------------
+Cron job fails → Sandbox expires → OpenClaw stops
+
+The Solution:
+------------
+Automatically recreate sandbox from pre-configured snapshot
+
+
+TIMELINE VIEW:
+--------------
+
+Hour 0              Hour 5 (Timeout)      Hour 5:01
+  |                        |                  |
+  |   Sandbox Running      |   EXPIRED!       |   New Sandbox
+  |                        |                  |   Created from
+  |                        |                  |   Snapshot
+  v                        v                  v
+[Create]                [Dies]            [Recreate]
+Sandbox                  :(                from Snapshot
+  |                        |                  |
+  |                        |                  |
+  |                        X                  |
+  +----------------------> DEAD <-------------+
+                             │                │
+                             │                │
+                             └────────────────┘
+                                Auto-restart
+                                (< 30 seconds)
+
+
+DETAILED FLOW:
+--------------
+
+STEP 1: Create Master Snapshot (One-time setup)
+┌────────────────────────────────────────────────────────────┐
+│  1. Create temporary sandbox                               │
+│  2. Install OpenClaw                                       │
+│  3. Configure everything                                   │
+│  4. Create snapshot                                        │
+│     → snapshot_id: snap_abc123                             │
+└────────────────────────────────────────────────────────────┘
+
+
+STEP 2: When Sandbox Expires
+┌─────────────────────────────────────────────────────────────┐
+│                                                             │
+│  Monitoring Service (Every 1 minute):                       │
+│                                                             │
+│  if (sandbox.status == "stopped") {                         │
+│                                                             │
+│    // Sandbox died! Recreate it                            │
+│    newSandbox = vercel.createFromSnapshot(                 │
+│      snapshot: "snap_abc123",                              │
+│      timeout: "5h",                                        │
+│      ports: [18789]                                        │
+│    )                                                        │
+│                                                             │
+│    // Update database with new sandbox ID                  │
+│    database.update(user.id, newSandbox.id)                 │
+│                                                             │
+│    // User's URL stays the same (we proxy to new sandbox)  │
+│  }                                                          │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+
+
+VISUAL:
+-------
+
+User's Experience:
+                                                    
+     9:00 AM              2:00 PM              2:01 PM
+        |                    |                    |
+   Using OpenClaw       Sandbox Dies        Auto-Restart
+        |                    |                    |
+        v                    v                    v
+    ┌────────┐          ┌────────┐          ┌────────┐
+    │ Active │   →      │  Dead  │   →      │ Active │
+    │ sbx_01 │          │ sbx_01 │          │ sbx_02 │
+    └────────┘          └────────┘          └────────┘
+        |                    |                    |
+        |                    |                    |
+    ┌───▼──────────────────────────────────────▼───┐
+    │  User's Dashboard URL (stays the same)       │
+    │  https://your-app.com/dashboard/openclaw     │
+    └──────────────────────────────────────────────┘
+           ▲                                    ▲
+           │                                    │
+           └──── Your app proxies to ──────────┘
+                 correct sandbox
+
+
+PROS:
+✓ Fully automated recovery
+✓ Fast restart (< 30 seconds from snapshot)
+✓ No manual intervention
+
+CONS:
+✗ Brief downtime (10-30 seconds)
+✗ More sandbox creations = higher cost
+
+
+================================================================================
+STRATEGY 3: HYBRID APPROACH (Best Practice - What We Recommend)
+================================================================================
+
+Combine both methods for maximum reliability!
+
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                         HYBRID STRATEGY                             │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  PRIMARY: Auto-extend timeout (Strategy 1)                          │
+│  ↓                                                                  │
+│  Every 4 hours, cron extends sandbox timeout                        │
+│  → 99% uptime, seamless                                            │
+│                                                                     │
+│  BACKUP: Auto-restart from snapshot (Strategy 2)                    │
+│  ↓                                                                  │
+│  If cron fails and sandbox dies:                                    │
+│  → Monitoring detects death                                         │
+│  → Auto-recreates from snapshot                                     │
+│  → 30 seconds downtime, then back up                                │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+
+COMPLETE SYSTEM DIAGRAM:
+-------------------------
+
+┌──────────────────────────────────────────────────────────────────────┐
+│                    YOUR VERCEL APPLICATION                           │
+└────────────────────────────┬─────────────────────────────────────────┘
+                             │
+                             │
+        ┌────────────────────┼────────────────────┐
+        │                    │                    │
+        │                    │                    │
+   ┌────▼─────┐         ┌───▼────┐         ┌────▼─────┐
+   │  Cron    │         │ Health │         │  User    │
+   │  Job     │         │ Check  │         │  Dashboard│
+   │          │         │        │         │          │
+   │ Every    │         │ Every  │         │  Real    │
+   │ 4 hours  │         │ 1 min  │         │  Time    │
+   └────┬─────┘         └───┬────┘         └────┬─────┘
+        │                   │                   │
+        │ Extend            │ Monitor           │ Display
+        │ Timeout           │ Status            │ Status
+        │                   │                   │
+        └────────┬──────────┴──────────┬────────┘
+                 │                     │
+                 │                     │
+        ┌────────▼─────────────────────▼────────┐
+        │      VERCEL SANDBOX (User's)          │
+        │  ┌─────────────────────────────────┐  │
+        │  │         OpenClaw Instance        │  │
+        │  │                                  │  │
+        │  │  Status: RUNNING                 │  │
+        │  │  Uptime: 99.9%                   │  │
+        │  │  Port: 18789                     │  │
+        │  │                                  │  │
+        │  └─────────────────────────────────┘  │
+        └───────────────────────────────────────┘
+                         │
+                         │
+            If dies → Auto-recreate from snapshot
+
+
+TIMING DIAGRAM (24-hour view):
+-------------------------------
+
+0h    4h    8h    12h   16h   20h   24h
+|     |     |     |     |     |     |
+├─────┼─────┼─────┼─────┼─────┼─────┤
+│     │     │     │     │     │     │
+│     │     │     │     │     │     │
+▼     ▼     ▼     ▼     ▼     ▼     ▼
+Extend Extend Extend Extend Extend Extend
+  ↓     ↓     ↓     ↓     ↓     ↓
+ +5h   +5h   +5h   +5h   +5h   +5h
+
+Health checks every minute:
+├─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┤
+│ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │ │
+✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓ ✓
+(all healthy)
+
+If failure detected:
+├─┬─┬─┬─┬─X───────────────────────────────┐
+│ │ │ │ │ │                               │
+✓ ✓ ✓ ✓ ✓ ✗ Dead!                         │
+          │                               │
+          └───> Auto-restart <────────────┘
+                (30 seconds)
+                    │
+                    ▼
+                    ✓ Back online!
+
+
+COST ANALYSIS (Per User):
+--------------------------
+
+Strategy 1 (Auto-Extend Only):
+• Sandbox runs continuously: ~$20/month
+• Cron job: Free (included)
+• Total: ~$20/month
+
+Strategy 2 (Auto-Restart Only):
+• Sandbox recreations: 144/month (every 5h)
+• Cost per recreation: ~$0.10
+• Total: ~$14/month
+• BUT: 30 seconds downtime every 5 hours
+
+Strategy 3 (Hybrid):
+• Primary: Auto-extend (~$20/month)
+• Backup: Restarts only if cron fails (~$0.50/month)
+• Total: ~$20.50/month
+• Uptime: 99.9%+
+
+
+PROS:
+✓ Best uptime (99.9%+)
+✓ Automatic recovery
+✓ No manual intervention
+✓ User barely notices any issues
+
+CONS:
+✗ Slightly more complex
+✗ Need to monitor both systems
+
+
+================================================================================
+IMPLEMENTATION CHECKLIST
+================================================================================
+
+PRIMARY SYSTEM (Auto-Extend):
+□ Set up Vercel Cron job (every 4 hours)
+□ Create /api/cron/extend-sandboxes endpoint
+□ Add authentication for cron endpoint
+□ Store sandbox expiration times in database
+□ Test extension logic
+
+BACKUP SYSTEM (Auto-Restart):
+□ Create master OpenClaw snapshot
+□ Set up health check monitor (every 1 min)
+□ Create /api/sandbox/restart endpoint
+□ Test snapshot restoration speed
+□ Set up alerting for failures
+
+MONITORING:
+□ Log all extension attempts
+□ Log all restart attempts
+□ Set up uptime dashboard
+□ Create alerts for repeated failures
+□ Track costs per user
+
+
+================================================================================
+REAL-WORLD EXAMPLE
+================================================================================
+
+User: "John signs up for your OpenClaw SaaS"
+
+Timeline:
+---------
+
+Monday 9:00 AM
+  → John clicks "Create AI Agent"
+  → Your app creates sandbox: sbx_john_001
+  → Timeout set: 5 hours (expires at 2:00 PM)
+  → OpenClaw starts running
+  → John starts chatting with his AI
+
+Monday 1:00 PM (4 hours later)
+  → Vercel Cron job runs
+  → Checks: sbx_john_001 expires at 2:00 PM (< 1 hour away)
+  → Calls: vercel.extendTimeout(sbx_john_001, 5h)
+  → New expiration: 7:00 PM
+  → John doesn't notice anything
+
+Monday 5:00 PM (4 hours later)
+  → Cron runs again
+  → Extends to midnight
+  → John still chatting happily
+
+Monday 9:00 PM (4 hours later)
+  → Cron runs again
+  → Extends to 4:00 AM
+  → Seamless operation
+
+...this continues forever...
+
+Tuesday 3:00 AM (DISASTER - Cron fails!)
+  → Cron job doesn't run (bug in code)
+  → Sandbox expires at 4:00 AM
+  → Sandbox dies at 4:00 AM
+
+Tuesday 4:01 AM
+  → Health check detects: sbx_john_001 is dead
+  → Triggers auto-restart
+  → Creates sbx_john_002 from snapshot
+  → Takes 25 seconds
+  → OpenClaw back online at 4:01:25 AM
+  → John was asleep, never noticed
+
+Tuesday 9:00 AM
+  → Cron job fixed and runs again
+  → Back to normal auto-extend cycle
+  → Total downtime: 85 seconds (0.001% of 24h)
+
+
+================================================================================
+SUMMARY
+================================================================================
+
+Question: "How do we keep it running after it stops?"
+
+Answer: "We DON'T let it stop!"
+
+Method 1: Auto-extend timeout every 4 hours (primary)
+Method 2: Auto-restart from snapshot if it dies (backup)
+Method 3: Use both together (recommended)
+
+Result: 99.9%+ uptime, fully automated, user never notices
+
+Cost: ~$20/user/month for 24/7 operation
+
+================================================================================

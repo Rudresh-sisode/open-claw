@@ -1,0 +1,12 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/extend-sandboxes",
+      "schedule": "0 */4 * * *"
+    },
+    {
+      "path": "/api/cron/health-check",
+      "schedule": "* * * * *"
+    }
+  ]
+}
