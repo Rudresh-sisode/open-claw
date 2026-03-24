@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
+import { writeConfigAndStart } from '@/lib/vercel-sandbox'
 
 export async function POST() {
   try {
@@ -9,7 +10,6 @@ export async function POST() {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    // Check if user already has a sandbox
     const { data: existing } = await supabase
       .from('sandboxes')
       .select('*')
@@ -21,7 +21,6 @@ export async function POST() {
       return NextResponse.json({ error: 'You already have an active sandbox' }, { status: 409 })
     }
 
-    // Create sandbox record in DB (status: creating)
     const { data: sandbox, error: dbError } = await supabase
       .from('sandboxes')
       .insert({
@@ -35,7 +34,6 @@ export async function POST() {
 
     if (dbError) throw dbError
 
-    // Kick off Vercel sandbox creation asynchronously
     createVercelSandbox(user.id, sandbox.id).catch(console.error)
 
     await supabase.from('activity_logs').insert({
@@ -60,27 +58,47 @@ async function createVercelSandbox(userId: string, sandboxDbId: string) {
   try {
     const expiresAt = new Date(Date.now() + 5 * 60 * 60 * 1000)
 
-    // Call Vercel Sandbox API
-    const vercelRes = await fetch('https://api.vercel.com/v1/sandboxes', {
+    const vercelUrl = new URL('https://api.vercel.com/v1/sandboxes')
+    if (process.env.VERCEL_TEAM_ID) {
+      vercelUrl.searchParams.set('slug', process.env.VERCEL_TEAM_ID)
+    }
+
+    const snapshotId = process.env.OPENCLAW_SNAPSHOT_ID
+    const hasSnapshot = snapshotId && snapshotId !== 'placeholder'
+
+    const requestBody: Record<string, unknown> = {
+      timeout: 5 * 60 * 60 * 1000,
+      ports: [18789],
+      runtime: 'node22',
+    }
+
+    if (process.env.VERCEL_PROJECT_ID) {
+      requestBody.projectId = process.env.VERCEL_PROJECT_ID
+    }
+    if (hasSnapshot) {
+      requestBody.source = { type: 'snapshot', snapshotId }
+    }
+
+    console.log('[sandbox/create] POST', vercelUrl.toString(), JSON.stringify(requestBody))
+
+    const vercelRes = await fetch(vercelUrl.toString(), {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${process.env.VERCEL_API_TOKEN}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        snapshotId: process.env.OPENCLAW_SNAPSHOT_ID,
-        timeout: 18000, // 5 hours in seconds
-        ports: [{ port: 18789, protocol: 'http' }],
-        ...(process.env.VERCEL_TEAM_ID && { teamId: process.env.VERCEL_TEAM_ID }),
-      }),
+      body: JSON.stringify(requestBody),
     })
 
     if (!vercelRes.ok) {
       const errData = await vercelRes.json().catch(() => ({}))
-      throw new Error(errData.error?.message || `Vercel API error: ${vercelRes.status}`)
+      const msg = errData?.error?.message ?? errData?.message ?? JSON.stringify(errData)
+      throw new Error(`Vercel API error ${vercelRes.status}: ${msg}`)
     }
 
-    const { id: sandboxId } = await vercelRes.json()
+    const responseData = await vercelRes.json()
+    const sandboxId: string = responseData?.sandbox?.id ?? responseData?.id
+    if (!sandboxId) throw new Error(`No sandbox ID in response: ${JSON.stringify(responseData)}`)
 
     await adminSupabase
       .from('sandboxes')
@@ -98,6 +116,9 @@ async function createVercelSandbox(userId: string, sandboxDbId: string) {
       status: 'success',
       message: `Sandbox ${sandboxId} created successfully`,
     })
+
+    // Wait for sandbox to fully boot, then configure and start OpenClaw
+    await bootstrapOpenClaw(adminSupabase, userId, sandboxId)
   } catch (error) {
     await adminSupabase
       .from('sandboxes')
@@ -109,6 +130,62 @@ async function createVercelSandbox(userId: string, sandboxDbId: string) {
       action: 'create',
       status: 'failed',
       message: `Failed to create sandbox: ${(error as Error).message}`,
+    })
+  }
+}
+
+async function bootstrapOpenClaw(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  adminSupabase: any,
+  userId: string,
+  sandboxId: string
+) {
+  try {
+    await new Promise((r) => setTimeout(r, 5000))
+
+    const [llmRes, telegramRes] = await Promise.all([
+      adminSupabase.from('llm_configs').select('*').eq('user_id', userId).single(),
+      adminSupabase.from('telegram_configs').select('*').eq('user_id', userId).single(),
+    ])
+
+    if (!llmRes.data) {
+      console.log('[bootstrap] No LLM config found, skipping OpenClaw start')
+      return
+    }
+
+    const telegramConfig = telegramRes.data?.enabled
+      ? {
+          botToken: telegramRes.data.bot_token,
+          dmPolicy: telegramRes.data.dm_policy,
+          groupPolicy: telegramRes.data.group_policy,
+          streaming: telegramRes.data.streaming,
+          linkPreview: telegramRes.data.link_preview,
+          allowFrom: telegramRes.data.allow_from,
+        }
+      : undefined
+
+    await writeConfigAndStart(sandboxId, {
+      provider: llmRes.data.provider,
+      apiKey: llmRes.data.api_key,
+      model: llmRes.data.model,
+      telegram: telegramConfig,
+    })
+
+    await adminSupabase.from('activity_logs').insert({
+      user_id: userId,
+      sandbox_id: sandboxId,
+      action: 'bootstrap',
+      status: 'success',
+      message: 'OpenClaw configured and started inside sandbox',
+    })
+  } catch (error) {
+    console.error('[bootstrap] Non-fatal error:', error)
+    await adminSupabase.from('activity_logs').insert({
+      user_id: userId,
+      sandbox_id: sandboxId,
+      action: 'bootstrap',
+      status: 'failed',
+      message: `Bootstrap failed: ${(error as Error).message}`,
     })
   }
 }

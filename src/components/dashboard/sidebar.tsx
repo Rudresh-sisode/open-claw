@@ -9,6 +9,7 @@ import {
   Settings,
   Activity,
   Bot,
+  Brain,
   LogOut,
   Zap,
 } from 'lucide-react'
@@ -72,6 +73,18 @@ export function Sidebar() {
           <p className="px-3 pb-2 text-xs font-semibold uppercase tracking-wider text-zinc-600">
             Setup
           </p>
+          <Link
+            href="/dashboard/setup/ai-provider"
+            className={cn(
+              'flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors',
+              pathname === '/dashboard/setup/ai-provider'
+                ? 'bg-indigo-600/15 text-indigo-400 border border-indigo-600/20'
+                : 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-100'
+            )}
+          >
+            <Brain className="h-4 w-4 shrink-0" />
+            AI Provider
+          </Link>
           <Link
             href="/dashboard/setup/telegram"
             className={cn(

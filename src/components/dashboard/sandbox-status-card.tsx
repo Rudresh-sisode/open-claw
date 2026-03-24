@@ -26,6 +26,7 @@ interface SandboxStatusCardProps {
 export function SandboxStatusCard({ sandbox, onRefresh }: SandboxStatusCardProps) {
   const [isCreating, setIsCreating] = useState(false)
   const [isRestarting, setIsRestarting] = useState(false)
+  const [isBootstrapping, setIsBootstrapping] = useState(false)
   const { toast } = useToast()
 
   const statusConfig = {
@@ -65,6 +66,21 @@ export function SandboxStatusCard({ sandbox, onRefresh }: SandboxStatusCardProps
       toast({ title: 'Error', description: (err as Error).message, variant: 'destructive' })
     } finally {
       setIsRestarting(false)
+    }
+  }
+
+  async function handleBootstrap() {
+    setIsBootstrapping(true)
+    try {
+      const res = await fetch('/api/sandbox/bootstrap', { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || 'Failed to start OpenClaw')
+      toast({ title: 'OpenClaw started!', description: 'Your AI agent is now running. Try messaging your Telegram bot.' , variant: 'success' })
+      onRefresh()
+    } catch (err) {
+      toast({ title: 'Error', description: (err as Error).message, variant: 'destructive' })
+    } finally {
+      setIsBootstrapping(false)
     }
   }
 
@@ -119,8 +135,39 @@ export function SandboxStatusCard({ sandbox, onRefresh }: SandboxStatusCardProps
               </div>
             )}
 
-            <div className="flex gap-2 pt-1">
-              {sandbox.status === 'stopped' || sandbox.status === 'error' ? (
+            <div className="flex gap-2 pt-1 flex-wrap">
+              {sandbox.status === 'running' && (
+                <>
+                  <Button
+                    size="sm"
+                    onClick={handleBootstrap}
+                    disabled={isBootstrapping}
+                    className="flex-1 gap-1.5"
+                  >
+                    {isBootstrapping ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Play className="h-3.5 w-3.5" />
+                    )}
+                    {isBootstrapping ? 'Starting...' : 'Start OpenClaw'}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={handleRestart}
+                    disabled={isRestarting}
+                    className="gap-1.5"
+                  >
+                    {isRestarting ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-3.5 w-3.5" />
+                    )}
+                    Restart
+                  </Button>
+                </>
+              )}
+              {(sandbox.status === 'stopped' || sandbox.status === 'error') && (
                 <Button
                   size="sm"
                   onClick={handleRestart}
@@ -134,7 +181,7 @@ export function SandboxStatusCard({ sandbox, onRefresh }: SandboxStatusCardProps
                   )}
                   {isRestarting ? 'Restarting...' : 'Restart'}
                 </Button>
-              ) : null}
+              )}
               <Button size="sm" variant="outline" onClick={onRefresh} className="gap-1.5">
                 <RefreshCw className="h-3.5 w-3.5" />
                 Refresh

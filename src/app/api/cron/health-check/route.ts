@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createAdminClient } from '@/lib/supabase/server'
+import { writeConfigAndStart } from '@/lib/vercel-sandbox'
 
 // This endpoint is called by Vercel Cron every minute
 // It checks for dead sandboxes and auto-restarts them from snapshot
@@ -59,7 +60,7 @@ export async function GET(req: NextRequest) {
         }
 
         // Sandbox is dead — try to restart from snapshot
-        const snapshotId = sandbox.snapshot_id ?? process.env.OPENCLAW_SNAPSHOT_ID
+        const snapshotId = process.env.OPENCLAW_SNAPSHOT_ID || sandbox.snapshot_id
         if (!snapshotId) {
           await adminSupabase
             .from('sandboxes')
@@ -75,24 +76,43 @@ export async function GET(req: NextRequest) {
           .update({ status: 'restarting' })
           .eq('id', sandbox.id)
 
-        // Create new sandbox from snapshot
-        const vercelRes = await fetch('https://api.vercel.com/v1/sandboxes', {
+        // Vercel Sandbox API — slug as query param, source/ports/timeout in body
+        const vercelUrl = new URL('https://api.vercel.com/v1/sandboxes')
+        if (process.env.VERCEL_TEAM_ID) {
+          vercelUrl.searchParams.set('slug', process.env.VERCEL_TEAM_ID)
+        }
+
+        const hasSnapshot = snapshotId && snapshotId !== 'placeholder'
+        const requestBody: Record<string, unknown> = {
+          timeout: 5 * 60 * 60 * 1000,
+          ports: [18789],
+          runtime: 'node22',
+        }
+        if (process.env.VERCEL_PROJECT_ID) {
+          requestBody.projectId = process.env.VERCEL_PROJECT_ID
+        }
+        if (hasSnapshot) {
+          requestBody.source = { type: 'snapshot', snapshotId }
+        }
+
+        const vercelRes = await fetch(vercelUrl.toString(), {
           method: 'POST',
           headers: {
             Authorization: `Bearer ${process.env.VERCEL_API_TOKEN}`,
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({
-            snapshotId,
-            timeout: 18000,
-            ports: [{ port: 18789, protocol: 'http' }],
-            ...(process.env.VERCEL_TEAM_ID && { teamId: process.env.VERCEL_TEAM_ID }),
-          }),
+          body: JSON.stringify(requestBody),
         })
 
-        if (!vercelRes.ok) throw new Error(`Vercel API error: ${vercelRes.status}`)
+        if (!vercelRes.ok) {
+          const errData = await vercelRes.json().catch(() => ({}))
+          const msg = errData?.error?.message ?? errData?.message ?? JSON.stringify(errData)
+          throw new Error(`Vercel API error ${vercelRes.status}: ${msg}`)
+        }
 
-        const { id: newSandboxId } = await vercelRes.json()
+        const responseData = await vercelRes.json()
+        const newSandboxId: string = responseData?.sandbox?.id ?? responseData?.id
+        if (!newSandboxId) throw new Error(`No sandbox ID in response: ${JSON.stringify(responseData)}`)
         const newExpiresAt = new Date(Date.now() + 5 * 60 * 60 * 1000).toISOString()
 
         await adminSupabase
@@ -112,6 +132,33 @@ export async function GET(req: NextRequest) {
           message: `Auto-restarted from snapshot (was ${sandbox.sandbox_id})`,
           metadata: { previous_sandbox_id: sandbox.sandbox_id },
         })
+
+        // Bootstrap OpenClaw inside the new sandbox
+        try {
+          await new Promise((r) => setTimeout(r, 5000))
+          const [llmRes, telegramRes] = await Promise.all([
+            adminSupabase.from('llm_configs').select('*').eq('user_id', sandbox.user_id).single(),
+            adminSupabase.from('telegram_configs').select('*').eq('user_id', sandbox.user_id).single(),
+          ])
+          if (llmRes.data) {
+            const tg = telegramRes.data?.enabled ? {
+              botToken: telegramRes.data.bot_token,
+              dmPolicy: telegramRes.data.dm_policy,
+              groupPolicy: telegramRes.data.group_policy,
+              streaming: telegramRes.data.streaming,
+              linkPreview: telegramRes.data.link_preview,
+              allowFrom: telegramRes.data.allow_from,
+            } : undefined
+            await writeConfigAndStart(newSandboxId, {
+              provider: llmRes.data.provider,
+              apiKey: llmRes.data.api_key,
+              model: llmRes.data.model,
+              telegram: tg,
+            })
+          }
+        } catch (bootstrapErr) {
+          console.error('[cron/health-check] Bootstrap failed:', bootstrapErr)
+        }
 
         restarted.push(newSandboxId)
       } catch (err) {

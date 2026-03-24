@@ -5,7 +5,7 @@ export default async function DashboardPage() {
   const supabase = await createClient()
   const { data: { user } } = await supabase.auth.getUser()
 
-  const [sandboxRes, telegramRes, logsRes] = await Promise.all([
+  const [sandboxRes, telegramRes, llmRes, logsRes] = await Promise.all([
     supabase
       .from('sandboxes')
       .select('*')
@@ -15,6 +15,11 @@ export default async function DashboardPage() {
       .maybeSingle(),
     supabase
       .from('telegram_configs')
+      .select('*')
+      .eq('user_id', user!.id)
+      .maybeSingle(),
+    supabase
+      .from('llm_configs')
       .select('*')
       .eq('user_id', user!.id)
       .maybeSingle(),
@@ -31,6 +36,7 @@ export default async function DashboardPage() {
       user={user!}
       initialSandbox={sandboxRes.data}
       initialTelegramConfig={telegramRes.data}
+      initialLlmConfig={llmRes.data}
       initialLogs={logsRes.data ?? []}
     />
   )
