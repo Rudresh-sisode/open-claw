@@ -40,6 +40,39 @@ export async function executeCommand(
   return res.json()
 }
 
+async function runAndWaitForOutput(
+  sandboxId: string,
+  command: string,
+  args: string[],
+  env: Record<string, string>
+): Promise<string> {
+  const result = await executeCommand(sandboxId, command, args, { env })
+  const cmdId = result?.command?.id
+  if (!cmdId) return ''
+
+  await new Promise(r => setTimeout(r, 2000))
+
+  const token = process.env.VERCEL_API_TOKEN
+  const teamSlug = process.env.VERCEL_TEAM_ID
+  const logUrl = new URL(`https://api.vercel.com/v1/sandboxes/${sandboxId}/cmd/${cmdId}/logs`)
+  if (teamSlug) logUrl.searchParams.set('slug', teamSlug)
+
+  try {
+    const logRes = await fetch(logUrl.toString(), {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(5000),
+    })
+    const text = await logRes.text()
+    return text
+      .split('\n')
+      .filter(Boolean)
+      .map(line => { try { return JSON.parse(line).data ?? '' } catch { return line } })
+      .join('')
+  } catch {
+    return ''
+  }
+}
+
 export async function writeConfigAndStart(
   sandboxId: string,
   config: {
@@ -64,86 +97,69 @@ export async function writeConfigAndStart(
     openrouter: 'OPENROUTER_API_KEY',
   }
 
-  const dmPolicy = config.telegram?.dmPolicy ?? 'open'
-  const groupPolicy = config.telegram?.groupPolicy ?? 'open'
-
-  let allowFrom = config.telegram?.allowFrom ?? []
-  if (dmPolicy === 'open' && !allowFrom.includes('*')) {
-    allowFrom = ['*']
-  }
-
-  const configObj: Record<string, unknown> = {
-    gateway: {
-      mode: 'local',
-    },
-    agents: {
-      defaults: {
-        model: config.model,
-        provider: config.provider,
-      },
-    },
-  }
-
-  if (config.telegram?.botToken) {
-    configObj.channels = {
-      telegram: {
-        enabled: true,
-        botToken: config.telegram.botToken,
-        dmPolicy,
-        allowFrom,
-        groupPolicy,
-        groupAllowFrom: groupPolicy === 'open' ? ['*'] : undefined,
-        groups: { '*': { requireMention: true } },
-        streaming: config.telegram.streaming ?? 'partial',
-        linkPreview: config.telegram.linkPreview ?? false,
-      },
-    }
-  }
-
-  const configJson = JSON.stringify(configObj, null, 2)
-  const envKey = envKeyMap[config.provider] ?? 'API_KEY'
   const homeDir = '/home/vercel-sandbox'
-  const configDir = `${homeDir}/.openclaw`
+  const envKey = envKeyMap[config.provider] ?? 'API_KEY'
 
-  // Build env vars for all commands — set OPENCLAW_CONFIG_PATH
-  // explicitly so OpenClaw finds the config regardless of HOME resolution
   const env: Record<string, string> = {
     HOME: homeDir,
-    OPENCLAW_CONFIG_PATH: `${configDir}/config.json5`,
-    OPENCLAW_STATE_DIR: configDir,
     [envKey]: config.apiKey,
   }
   if (config.telegram?.botToken) {
     env.TELEGRAM_BOT_TOKEN = config.telegram.botToken
   }
 
-  // 1. Create config directory
-  await executeCommand(sandboxId, 'mkdir', ['-p', configDir], { env })
-  console.log(`[bootstrap] Created ${configDir} on ${sandboxId}`)
+  // Step 1: Set bot token and model via env vars and config set
+  console.log(`[bootstrap] Configuring openclaw on ${sandboxId}`)
 
-  // 2. Write config file
-  await executeCommand(sandboxId, 'sh', [
-    '-c',
-    `cat > ${configDir}/config.json5 << 'OPENCLAW_CFG_EOF'\n${configJson}\nOPENCLAW_CFG_EOF`,
-  ], { env })
-  console.log(`[bootstrap] Wrote config.json5 on ${sandboxId}`)
+  const configSets: [string, string][] = [
+    ['agents.defaults.model', config.model],
+    ['agents.defaults.provider', config.provider],
+  ]
 
-  // 3. Validate config location
-  const fileCheck = await executeCommand(sandboxId, 'openclaw', ['config', 'file'], { env })
-  console.log(`[bootstrap] Config file location:`, fileCheck?.command?.id)
+  if (config.telegram?.botToken) {
+    configSets.push(['channels.telegram.enabled', 'true'])
+    configSets.push(['channels.telegram.botToken', config.telegram.botToken])
+  }
 
-  // 4. Start OpenClaw gateway DIRECTLY (no nohup/&)
-  // The Vercel execute API already runs commands asynchronously,
-  // so the gateway process stays alive as a managed command.
+  for (const [key, value] of configSets) {
+    const out = await runAndWaitForOutput(sandboxId, 'openclaw', ['config', 'set', key, value], env)
+    console.log(`[bootstrap] config set ${key}:`, out.slice(0, 100))
+  }
+
+  // Step 2: Start the gateway — pairing mode (default), stays alive as a managed process
+  console.log(`[bootstrap] Starting openclaw gateway on ${sandboxId}`)
   const startRes = await executeCommand(
     sandboxId,
     'openclaw',
-    ['gateway', '--auth', 'none'],
+    ['gateway', '--auth', 'none', '--allow-unconfigured'],
     { env }
   )
-  console.log(`[bootstrap] Started openclaw gateway on ${sandboxId}:`, startRes?.command?.id)
+  console.log(`[bootstrap] Gateway started:`, startRes?.command?.id)
 
   return { configWritten: true, startCommand: startRes?.command?.id }
+}
+
+export async function approvePairing(
+  sandboxId: string,
+  code: string
+): Promise<string> {
+  const homeDir = '/home/vercel-sandbox'
+  return runAndWaitForOutput(
+    sandboxId,
+    'openclaw',
+    ['pairing', 'approve', 'telegram', code],
+    { HOME: homeDir }
+  )
+}
+
+export async function listPendingPairings(sandboxId: string): Promise<string> {
+  const homeDir = '/home/vercel-sandbox'
+  return runAndWaitForOutput(
+    sandboxId,
+    'openclaw',
+    ['pairing', 'list', 'telegram'],
+    { HOME: homeDir }
+  )
 }
 
 export async function getSandboxStatus(sandboxId: string) {

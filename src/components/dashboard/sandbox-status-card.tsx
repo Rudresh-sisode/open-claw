@@ -4,6 +4,7 @@ import { useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import { Progress } from '@/components/ui/progress'
 import { Sandbox } from '@/types'
 import { formatTimeRemaining } from '@/lib/utils'
@@ -15,6 +16,8 @@ import {
   Clock,
   Wifi,
   WifiOff,
+  KeyRound,
+  Check,
 } from 'lucide-react'
 import { useToast } from '@/components/ui/use-toast'
 
@@ -27,6 +30,9 @@ export function SandboxStatusCard({ sandbox, onRefresh }: SandboxStatusCardProps
   const [isCreating, setIsCreating] = useState(false)
   const [isRestarting, setIsRestarting] = useState(false)
   const [isBootstrapping, setIsBootstrapping] = useState(false)
+  const [pairingCode, setPairingCode] = useState('')
+  const [isApproving, setIsApproving] = useState(false)
+  const [pairingApproved, setPairingApproved] = useState(false)
   const { toast } = useToast()
 
   const statusConfig = {
@@ -81,6 +87,30 @@ export function SandboxStatusCard({ sandbox, onRefresh }: SandboxStatusCardProps
       toast({ title: 'Error', description: (err as Error).message, variant: 'destructive' })
     } finally {
       setIsBootstrapping(false)
+    }
+  }
+
+  async function handlePairingApprove() {
+    if (!pairingCode.trim()) return
+    setIsApproving(true)
+    try {
+      const res = await fetch('/api/sandbox/pairing-approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: pairingCode.trim() }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || 'Failed to approve pairing')
+      setPairingApproved(true)
+      toast({
+        title: 'Pairing approved!',
+        description: 'Your Telegram bot is now connected. Send it a message!',
+        variant: 'success',
+      })
+    } catch (err) {
+      toast({ title: 'Error', description: (err as Error).message, variant: 'destructive' })
+    } finally {
+      setIsApproving(false)
     }
   }
 
@@ -187,6 +217,48 @@ export function SandboxStatusCard({ sandbox, onRefresh }: SandboxStatusCardProps
                 Refresh
               </Button>
             </div>
+
+            {sandbox?.status === 'running' && (
+              <div className="rounded-lg border border-zinc-700/50 bg-zinc-800/30 p-3 space-y-2">
+                <div className="flex items-center gap-2 text-xs text-zinc-400">
+                  <KeyRound className="h-3.5 w-3.5 text-amber-400" />
+                  <span className="font-medium">Telegram Pairing</span>
+                </div>
+                <p className="text-xs text-zinc-500">
+                  After clicking &quot;Start OpenClaw&quot;, message your bot on Telegram.
+                  It will reply with a pairing code. Enter it below to activate.
+                </p>
+                {pairingApproved ? (
+                  <div className="flex items-center gap-2 text-xs text-emerald-400">
+                    <Check className="h-3.5 w-3.5" />
+                    Paired! Your bot is ready to chat.
+                  </div>
+                ) : (
+                  <div className="flex gap-2">
+                    <Input
+                      placeholder="Enter pairing code (e.g. KUYARN9J)"
+                      value={pairingCode}
+                      onChange={(e) => setPairingCode(e.target.value.toUpperCase())}
+                      className="h-8 text-xs bg-zinc-900 border-zinc-700"
+                      onKeyDown={(e) => e.key === 'Enter' && handlePairingApprove()}
+                    />
+                    <Button
+                      size="sm"
+                      onClick={handlePairingApprove}
+                      disabled={isApproving || !pairingCode.trim()}
+                      className="h-8 px-3 gap-1.5 shrink-0"
+                    >
+                      {isApproving ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <Check className="h-3 w-3" />
+                      )}
+                      Approve
+                    </Button>
+                  </div>
+                )}
+              </div>
+            )}
           </>
         ) : (
           <div className="flex flex-col items-center gap-4 py-4">
